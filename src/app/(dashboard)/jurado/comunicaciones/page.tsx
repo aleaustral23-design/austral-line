@@ -9,8 +9,8 @@ import { Label } from "@/components/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { modoPrueba } from "../_resend";
 import { cancelarProgramados, enviarPrueba, guardarMaterialPost, programarPostEvento, programarRecordatorios } from "./acciones";
-import { cargarDatos, faltantesPostEvento, urlBase } from "./datos";
-import { diaSiguienteALas9, fechaHora, mailRecordatorio } from "./plantillas";
+import { armarPostEvento, cargarDatos, estadosActivos, faltantesPostEvento, urlBase, ventanaPostEvento } from "./datos";
+import { fechaHora, mailRecordatorio } from "./plantillas";
 
 const nombresTipo: Record<string, string> = {
   recordatorio_24h: "Recordatorio 24 h",
@@ -27,6 +27,7 @@ export default async function Comunicaciones({ searchParams }: PageProps<"/jurad
   const { data: eventos, error: errorEventos } = await supabase.from("eventos").select("id, nombre, inicio").order("inicio");
   if (errorEventos) throw errorEventos;
   const ahora = new Date().toISOString();
+  const ahoraMs = new Date(ahora).getTime();
   const eventoId = typeof eventoElegido === "string" ? eventoElegido : (eventos.find((e) => e.inicio > ahora) ?? eventos.at(-1))?.id;
 
   const datos = eventoId ? await cargarDatos(supabase, eventoId) : null;
@@ -37,8 +38,17 @@ export default async function Comunicaciones({ searchParams }: PageProps<"/jurad
 
   const pendientes = (tipos: string[]) =>
     envios.filter((e) => tipos.includes(e.tipo) && ["programado", "simulado"].includes(e.estado) && e.programado_para && e.programado_para > ahora);
-  const recordatoriosActivos = envios.some((e) => e.tipo.startsWith("recordatorio") && ["programado", "simulado", "enviado"].includes(e.estado));
-  const postActivo = envios.some((e) => e.tipo === "post_evento" && ["programado", "simulado", "enviado"].includes(e.estado));
+  // Jurados que todavía no tienen cada mail (por ejemplo, si se sumaron después de programar).
+  const activos = envios.filter((e) => estadosActivos().includes(e.estado));
+  const sinMail = (tipos: string[]) =>
+    (datos?.jurados ?? []).filter((j) => !activos.some((e) => tipos.includes(e.tipo) && e.persona_id === j.id));
+  const yaHayRecordatorios = activos.some((e) => e.tipo.startsWith("recordatorio"));
+  const yaHayPost = activos.some((e) => e.tipo === "post_evento");
+  const faltanRecordatorio = sinMail(["recordatorio_24h", "recordatorio_1h"]);
+  const faltanPost = sinMail(["post_evento"]);
+  const nombres = (js: { nombre: string }[]) => js.map((j) => j.nombre).join(", ");
+  const ventana = ventanaPostEvento(datos?.evento.inicio ?? ahora);
+  const urlMails = await urlBase();
 
   return (
     <div className="mx-auto max-w-4xl">
@@ -81,16 +91,29 @@ export default async function Comunicaciones({ searchParams }: PageProps<"/jurad
             <p className="mb-6 text-sm text-[#666]">
               Dos recordatorios por jurado: 24 h y 1 h antes del inicio, con fecha, lugar, proyectos, criterios y link a las fichas.
             </p>
-            <iframe
-              title="Vista previa del recordatorio"
-              sandbox=""
-              srcDoc={mailRecordatorio({ tipo: "recordatorio_24h", jurado: datos.jurados[0]?.nombre ?? "Nombre del jurado", ...datos, url: await urlBase() }).html}
-              className="mb-6 h-[480px] w-full border bg-white"
-            />
+            {(() => {
+              // Muestra el recordatorio que va a salir: si ya pasó el de 24 h, el de 1 h.
+              const tipo = new Date(datos.evento.inicio).getTime() - 24 * 60 * 60 * 1000 > ahoraMs ? "recordatorio_24h" : "recordatorio_1h";
+              return (
+                <>
+                  <p className="mb-2 text-xs text-[#666]">Vista previa: recordatorio {tipo === "recordatorio_24h" ? "de 24 h" : "de 1 h"}</p>
+                  <iframe
+                    title="Vista previa del recordatorio"
+                    sandbox=""
+                    srcDoc={mailRecordatorio({ tipo, jurado: datos.jurados[0]?.nombre ?? "Nombre del jurado", ...datos, url: urlMails }).html}
+                    className="mb-6 h-[480px] w-full border bg-white"
+                  />
+                </>
+              );
+            })()}
             <div className="flex flex-wrap gap-3">
               <form action={programarRecordatorios}>
                 <input type="hidden" name="evento_id" value={datos.evento.id} />
-                <Button type="submit" size="lg" disabled={recordatoriosActivos}>Programar recordatorios</Button>
+                <Button type="submit" size="lg" disabled={yaHayRecordatorios && faltanRecordatorio.length === 0}>
+                  {yaHayRecordatorios && faltanRecordatorio.length > 0
+                    ? `Programar para ${faltanRecordatorio.length === 1 ? "el jurado que falta" : `los ${faltanRecordatorio.length} jurados que faltan`}`
+                    : "Programar recordatorios"}
+                </Button>
               </form>
               <form action={enviarPrueba}>
                 <input type="hidden" name="evento_id" value={datos.evento.id} />
@@ -105,14 +128,26 @@ export default async function Comunicaciones({ searchParams }: PageProps<"/jurad
                 </form>
               )}
             </div>
-            {recordatoriosActivos && <p className="mt-3 text-sm text-[#666]">Ya están programados. Si cambia el horario del evento, cancelalos y volvé a programarlos.</p>}
+            {yaHayRecordatorios && (
+              <p className="mt-3 text-sm text-[#666]">
+                {faltanRecordatorio.length > 0
+                  ? `Todavía no tienen recordatorio: ${nombres(faltanRecordatorio)}. `
+                  : "Todos los jurados tienen sus recordatorios. "}
+                Si cambia el horario del evento, cancelá los pendientes y volvé a programarlos.
+              </p>
+            )}
           </section>
 
           <section className="mb-14">
             <h2 className="mb-1 font-serif text-xl">Después del evento</h2>
             <p className="mb-6 text-sm text-[#666]">
-              Sale el día siguiente a las 9:00 ({fechaHora(diaSiguienteALas9(datos.evento.inicio))}) con 3 fotos destacadas, 1 video resumen y los contactos de cada equipo. Pegá links públicos (Google Drive, Fotos, YouTube…).
+              Sale el día siguiente a las 9:00 ({fechaHora(ventana.desde.toISOString())}) con 3 fotos destacadas, 1 video resumen y los contactos de cada equipo. Pegá links públicos (Google Drive, Fotos, YouTube…).
             </p>
+            {ahoraMs > ventana.hasta.getTime() && !yaHayPost && (
+              <p className="mb-6 border-l-2 border-destructive pl-4 text-sm">
+                Ya pasó la ventana ideal (día siguiente al evento, de 9 a 12 hs). Si lo programás ahora, sale en el momento para no demorarlo más.
+              </p>
+            )}
             <form className="grid gap-5">
               <input type="hidden" name="evento_id" value={datos.evento.id} />
               <input type="hidden" name="tipo" value="post_evento" />
@@ -147,16 +182,33 @@ export default async function Comunicaciones({ searchParams }: PageProps<"/jurad
                   </p>
                 ))}
               </div>
-              {faltantesPostEvento(datos).length > 0 && (
-                <p className="text-sm text-[#666]">Para poder mandarlo falta: {faltantesPostEvento(datos).join("; ")}.</p>
+              {faltantesPostEvento(datos).length > 0 ? (
+                <p className="text-sm text-[#666]">Para poder mandarlo falta: {faltantesPostEvento(datos).join("; ")}. Guardá el material para ver la vista previa.</p>
+              ) : (
+                <div>
+                  <p className="mb-2 text-xs text-[#666]">Vista previa del mail post-evento (con el material guardado)</p>
+                  <iframe
+                    title="Vista previa del mail post-evento"
+                    sandbox=""
+                    srcDoc={armarPostEvento(datos, datos.jurados[0]?.nombre ?? "Nombre del jurado").html}
+                    className="h-[480px] w-full border bg-white"
+                  />
+                </div>
               )}
 
               <div className="flex flex-wrap gap-3">
-                <Button type="submit" size="lg" formAction={programarPostEvento} disabled={postActivo}>Programar mail post-evento</Button>
+                <Button type="submit" size="lg" formAction={programarPostEvento} disabled={yaHayPost && faltanPost.length === 0}>
+                  {yaHayPost && faltanPost.length > 0
+                    ? `Mandar a ${faltanPost.length === 1 ? "el jurado que falta" : `los ${faltanPost.length} jurados que faltan`}`
+                    : ahoraMs > ventana.desde.getTime() ? "Mandar mail post-evento ahora" : "Programar mail post-evento"}
+                </Button>
                 <Button type="submit" variant="outline" size="lg" formAction={enviarPrueba}>Mandarme una prueba</Button>
                 <Button type="submit" variant="ghost" size="lg" formAction={guardarMaterialPost}>Guardar material</Button>
               </div>
             </form>
+            {yaHayPost && faltanPost.length > 0 && (
+              <p className="mt-3 text-sm text-[#666]">Todavía no lo tienen: {nombres(faltanPost)}.</p>
+            )}
             {pendientes(["post_evento"]).length > 0 && (
               <form action={cancelarProgramados} className="mt-3">
                 <input type="hidden" name="evento_id" value={datos.evento.id} />

@@ -6,8 +6,8 @@ import { getUsuario, requireRol } from "@/lib/auth";
 import { createClient } from "@/lib/supabase/server";
 import type { Database } from "@/lib/database.types";
 import { cancelarCorreo, enviarCorreos, modoPrueba, type Correo } from "../_resend";
-import { cargarDatos, faltantesPostEvento, urlBase, type Datos } from "./datos";
-import { diaSiguienteALas9, fechaHora, mailPostEvento, mailRecordatorio } from "./plantillas";
+import { armarPostEvento, cargarDatos, estadosActivos, faltantesPostEvento, urlBase, ventanaPostEvento, type Datos } from "./datos";
+import { fechaHora, mailRecordatorio } from "./plantillas";
 
 type Envio = Database["public"]["Tables"]["jurado_envios"]["Insert"];
 type Supabase = Awaited<ReturnType<typeof createClient>>;
@@ -15,7 +15,6 @@ type Supabase = Awaited<ReturnType<typeof createClient>>;
 const UNA_HORA = 60 * 60 * 1000;
 const LIMITE_RESEND = 30 * 24 * UNA_HORA; // Resend programa hasta 30 días antes
 const RECORDATORIOS = ["recordatorio_24h", "recordatorio_1h"];
-const ACTIVOS = ["programado", "simulado", "enviado"];
 
 function volver(eventoId: string, tipo: "ok" | "error", mensaje: string): never {
   revalidatePath("/jurado/comunicaciones");
@@ -44,11 +43,12 @@ async function mandarYRegistrar(supabase: Supabase, correos: Correo[], filas: En
   return resultado.ok ? null : resultado.error;
 }
 
-async function yaHay(supabase: Supabase, eventoId: string, tipos: string[]) {
+// Qué jurados ya tienen cada mail ("tipo:persona"), para mandarle solo a los que faltan (por ejemplo, jurados nuevos).
+async function yaLoTienen(supabase: Supabase, eventoId: string, tipos: string[]) {
   const { data, error } = await supabase
-    .from("jurado_envios").select("id").eq("evento_id", eventoId).in("tipo", tipos).in("estado", ACTIVOS).limit(1);
+    .from("jurado_envios").select("tipo, persona_id").eq("evento_id", eventoId).in("tipo", tipos).in("estado", estadosActivos());
   if (error) throw error;
-  return data.length > 0;
+  return new Set(data.map((e) => `${e.tipo}:${e.persona_id}`));
 }
 
 const aviso = (mensaje: string) => (modoPrueba() ? `Simulado (falta la clave de Resend, no salió ningún mail): ${mensaje}` : mensaje);
@@ -57,9 +57,7 @@ export async function programarRecordatorios(formData: FormData) {
   const { eventoId, supabase, datos } = await preparar(formData);
   const { evento, jurados, proyectos, criterios } = datos;
   if (jurados.length === 0) volver(eventoId, "error", "No hay jurados cargados en Miembros.");
-  if (await yaHay(supabase, eventoId, RECORDATORIOS)) {
-    volver(eventoId, "error", "Ya hay recordatorios para este evento. Si cambió el horario, cancelalos y volvé a programarlos.");
-  }
+  const tienen = await yaLoTienen(supabase, eventoId, RECORDATORIOS);
 
   const ahora = Date.now();
   const inicio = new Date(evento.inicio).getTime();
@@ -77,16 +75,20 @@ export async function programarRecordatorios(formData: FormData) {
   const filas: Envio[] = [];
   for (const { tipo, cuando } of tandas) {
     const programadoPara = new Date(cuando).toISOString();
-    for (const jurado of jurados) {
+    for (const jurado of jurados.filter((j) => !tienen.has(`${tipo}:${j.id}`))) {
       const { asunto, html } = mailRecordatorio({ tipo, jurado: jurado.nombre, evento, proyectos, criterios, url });
       correos.push({ para: jurado.email, asunto, html, programadoPara });
       filas.push({ evento_id: eventoId, tipo, persona_id: jurado.id, email: jurado.email, asunto, programado_para: programadoPara, estado: "programado" });
     }
   }
+  if (correos.length === 0) {
+    volver(eventoId, "error", "Todos los jurados ya tienen sus recordatorios. Si cambió el horario, cancelalos y volvé a programarlos.");
+  }
   const error = await mandarYRegistrar(supabase, correos, filas);
   if (error) volver(eventoId, "error", error);
-  const cuales = tandas.map((t) => (t.tipo === "recordatorio_24h" ? "24 h antes" : "1 h antes")).join(" y ");
-  volver(eventoId, "ok", aviso(`Recordatorios programados (${cuales}) para ${jurados.length} jurados.`));
+  const cuales = [...new Set(filas.map((f) => (f.tipo === "recordatorio_24h" ? "24 h antes" : "1 h antes")))].join(" y ");
+  const cuantos = new Set(filas.map((f) => f.persona_id)).size;
+  volver(eventoId, "ok", aviso(`Recordatorios programados (${cuales}) para ${cuantos} ${cuantos === 1 ? "jurado" : "jurados"}.`));
 }
 
 async function guardarMaterial(supabase: Supabase, eventoId: string, formData: FormData): Promise<Datos["material"]> {
@@ -104,18 +106,6 @@ async function guardarMaterial(supabase: Supabase, eventoId: string, formData: F
   return data;
 }
 
-function armarPostEvento(datos: Datos, jurado: string) {
-  const m = datos.material!;
-  return mailPostEvento({
-    jurado,
-    evento: datos.evento,
-    fotos: [m.foto_1!, m.foto_2!, m.foto_3!],
-    video: m.video!,
-    mensaje: m.mensaje,
-    equipos: datos.proyectos,
-  });
-}
-
 export async function guardarMaterialPost(formData: FormData) {
   const { eventoId, supabase } = await preparar(formData);
   await guardarMaterial(supabase, eventoId, formData);
@@ -128,30 +118,34 @@ export async function programarPostEvento(formData: FormData) {
   const faltantes = faltantesPostEvento(datos);
   if (faltantes.length) volver(eventoId, "error", `No se puede mandar todavía. Falta: ${faltantes.join("; ")}.`);
   if (datos.jurados.length === 0) volver(eventoId, "error", "No hay jurados cargados en Miembros.");
-  if (await yaHay(supabase, eventoId, ["post_evento"])) {
-    volver(eventoId, "error", "El mail post-evento de este evento ya está programado o enviado.");
-  }
+  const tienen = await yaLoTienen(supabase, eventoId, ["post_evento"]);
+  const faltan = datos.jurados.filter((j) => !tienen.has(`post_evento:${j.id}`));
+  if (faltan.length === 0) volver(eventoId, "error", "Todos los jurados ya tienen el mail post-evento programado o enviado.");
 
   const ahora = Date.now();
-  const cuando = new Date(diaSiguienteALas9(datos.evento.inicio)).getTime();
-  if (cuando - ahora > LIMITE_RESEND) {
-    volver(eventoId, "error", `Resend permite programar mails hasta 30 días antes. Vas a poder programarlo desde el ${fechaHora(new Date(cuando - LIMITE_RESEND).toISOString())}.`);
+  const { desde, hasta } = ventanaPostEvento(datos.evento.inicio);
+  if (desde.getTime() - ahora > LIMITE_RESEND) {
+    volver(eventoId, "error", `Resend permite programar mails hasta 30 días antes. Vas a poder programarlo desde el ${fechaHora(new Date(desde.getTime() - LIMITE_RESEND).toISOString())}.`);
   }
-  // Si ya pasaron las 9 del día siguiente, sale en el momento.
-  const programadoPara = cuando > ahora + 60_000 ? new Date(cuando).toISOString() : undefined;
+  // Antes de las 9 del día siguiente se programa; después sale en el momento para no demorarlo más.
+  const programadoPara = desde.getTime() > ahora + 60_000 ? desde.toISOString() : undefined;
+  const tarde = ahora > hasta.getTime();
 
   const correos: Correo[] = [];
   const filas: Envio[] = [];
-  for (const jurado of datos.jurados) {
+  for (const jurado of faltan) {
     const { asunto, html } = armarPostEvento(datos, jurado.nombre);
     correos.push({ para: jurado.email, asunto, html, programadoPara });
     filas.push({ evento_id: eventoId, tipo: "post_evento", persona_id: jurado.id, email: jurado.email, asunto, programado_para: programadoPara ?? null, estado: "programado" });
   }
   const error = await mandarYRegistrar(supabase, correos, filas);
   if (error) volver(eventoId, "error", error);
+  const a = `${faltan.length} ${faltan.length === 1 ? "jurado" : "jurados"}`;
   volver(eventoId, "ok", aviso(programadoPara
-    ? `Mail post-evento programado para el ${fechaHora(programadoPara)} a ${datos.jurados.length} jurados.`
-    : `Mail post-evento enviado a ${datos.jurados.length} jurados.`));
+    ? `Mail post-evento programado para el ${fechaHora(programadoPara)} a ${a}.`
+    : tarde
+      ? `Mail post-evento enviado a ${a}, fuera de la ventana ideal (día siguiente al evento, de 9 a 12 hs).`
+      : `Mail post-evento enviado a ${a}.`));
 }
 
 // Manda el mail al propio admin, en el momento, para revisar cómo llega.

@@ -2,6 +2,8 @@
 import { headers } from "next/headers";
 import type { createClient } from "@/lib/supabase/server";
 import { esLinkWeb, estadosEvaluables } from "../_lib";
+import { modoPrueba } from "../_resend";
+import { diaSiguienteALas9, mailPostEvento } from "./plantillas";
 
 type Cliente = Awaited<ReturnType<typeof createClient>>;
 
@@ -46,6 +48,28 @@ export function faltantesPostEvento({ material, proyectos }: Pick<Datos, "materi
   const sinContacto = proyectos.filter((p) => p.integrantes.length === 0).map((p) => p.nombre);
   if (sinContacto.length) faltantes.push(`los contactos de ${sinContacto.join(", ")} (los integrantes se suman en Miembros/Alumnos)`);
   return faltantes;
+}
+
+// Envíos que cuentan como "ya mandado o por salir". Con la clave de Resend cargada, lo simulado en modo prueba no cuenta.
+export const estadosActivos = () => (modoPrueba() ? ["programado", "simulado", "enviado"] : ["programado", "enviado"]);
+
+// Ventana ideal del mail post-evento según el relevamiento: el día siguiente, de 9 a 12 hs.
+export function ventanaPostEvento(inicio: string) {
+  const desde = new Date(diaSiguienteALas9(inicio));
+  return { desde, hasta: new Date(desde.getTime() + 3 * 60 * 60 * 1000) };
+}
+
+// Solo se llama con el material completo (ver faltantesPostEvento).
+export function armarPostEvento(datos: Datos, jurado: string) {
+  const m = datos.material!;
+  return mailPostEvento({
+    jurado,
+    evento: datos.evento,
+    fotos: [m.foto_1!, m.foto_2!, m.foto_3!],
+    video: m.video!,
+    mensaje: m.mensaje,
+    equipos: datos.proyectos,
+  });
 }
 
 // Dirección de la app para los links de los mails: en Vercel la de producción, en local la del navegador.
